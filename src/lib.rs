@@ -204,15 +204,12 @@
 //! [cargo-features]: https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-features-section
 
 macro_rules! if_wasm {
-    ($($item:item)*) => {$(
-        #[cfg(target_arch = "wasm32")]
-        $item
-    )*}
+    ($($item:item)*) => {
+    }
 }
 
 macro_rules! if_hyper {
     ($($item:item)*) => {$(
-        #[cfg(not(target_arch = "wasm32"))]
         $item
     )*}
 }
@@ -295,7 +292,6 @@ if_hyper! {
     pub use self::async_impl::{
         Body, Client, ClientBuilder, Request, RequestBuilder, Response,
     };
-    pub use self::proxy::Proxy;
     #[cfg(feature = "__tls")]
     // Re-exports, to be removed in a future release
     pub use tls::{Certificate, Identity};
@@ -311,7 +307,6 @@ if_hyper! {
     pub mod cookie;
     #[cfg(feature = "trust-dns")]
     mod dns;
-    mod proxy;
     pub mod redirect;
     #[cfg(feature = "__tls")]
     pub mod tls;

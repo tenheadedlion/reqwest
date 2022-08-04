@@ -6,7 +6,6 @@ use std::pin::Pin;
 use bytes::Bytes;
 use encoding_rs::{Encoding, UTF_8};
 use futures_util::stream::StreamExt;
-use hyper::client::connect::HttpInfo;
 use hyper::{HeaderMap, StatusCode, Version};
 use mime::Mime;
 #[cfg(feature = "json")]
@@ -105,10 +104,7 @@ impl Response {
 
     /// Get the remote address used to get this `Response`.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.res
-            .extensions()
-            .get::<HttpInfo>()
-            .map(|info| info.remote_addr())
+        None
     }
 
     /// Returns a reference to the associated extensions.

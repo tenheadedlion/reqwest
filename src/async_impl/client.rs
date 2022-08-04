@@ -1,5 +1,3 @@
-#[cfg(any(feature = "native-tls", feature = "__rustls",))]
-use std::any::Any;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,13 +7,9 @@ use std::{fmt, str};
 use bytes::Bytes;
 use http::header::{
     Entry, HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, LOCATION, PROXY_AUTHORIZATION, RANGE, REFERER, TRANSFER_ENCODING, USER_AGENT,
+    CONTENT_TYPE, LOCATION, RANGE, REFERER, TRANSFER_ENCODING, USER_AGENT,
 };
-use http::uri::Scheme;
-use http::Uri;
 use hyper::client::ResponseFuture;
-#[cfg(feature = "native-tls-crate")]
-use native_tls_crate::TlsConnector;
 use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
@@ -34,13 +28,7 @@ use crate::cookie;
 use crate::error;
 use crate::into_url::{expect_uri, try_uri};
 use crate::redirect::{self, remove_sensitive_headers};
-#[cfg(feature = "__tls")]
-use crate::tls::{self, TlsBackend};
-#[cfg(feature = "__tls")]
-use crate::Certificate;
-#[cfg(any(feature = "native-tls", feature = "__rustls"))]
-use crate::Identity;
-use crate::{IntoUrl, Method, Proxy, StatusCode, Url};
+use crate::{IntoUrl, Method, StatusCode, Url};
 
 /// An asynchronous `Client` to make Requests with.
 ///
@@ -85,23 +73,11 @@ struct Config {
     pool_idle_timeout: Option<Duration>,
     pool_max_idle_per_host: usize,
     tcp_keepalive: Option<Duration>,
-    #[cfg(any(feature = "native-tls", feature = "__rustls"))]
-    identity: Option<Identity>,
-    proxies: Vec<Proxy>,
-    auto_sys_proxy: bool,
     redirect_policy: redirect::Policy,
     referer: bool,
     timeout: Option<Duration>,
     #[cfg(feature = "__tls")]
-    root_certs: Vec<Certificate>,
-    #[cfg(feature = "__tls")]
     tls_built_in_root_certs: bool,
-    #[cfg(feature = "__tls")]
-    min_tls_version: Option<tls::Version>,
-    #[cfg(feature = "__tls")]
-    max_tls_version: Option<tls::Version>,
-    #[cfg(feature = "__tls")]
-    tls: TlsBackend,
     http_version_pref: HttpVersionPref,
     http09_responses: bool,
     http1_title_case_headers: bool,
@@ -153,23 +129,11 @@ impl ClientBuilder {
                 // TODO: Re-enable default duration once hyper's HttpConnector is fixed
                 // to no longer error when an option fails.
                 tcp_keepalive: None, //Some(Duration::from_secs(60)),
-                proxies: Vec::new(),
-                auto_sys_proxy: true,
                 redirect_policy: redirect::Policy::default(),
                 referer: true,
                 timeout: None,
                 #[cfg(feature = "__tls")]
-                root_certs: Vec::new(),
-                #[cfg(feature = "__tls")]
                 tls_built_in_root_certs: true,
-                #[cfg(any(feature = "native-tls", feature = "__rustls"))]
-                identity: None,
-                #[cfg(feature = "__tls")]
-                min_tls_version: None,
-                #[cfg(feature = "__tls")]
-                max_tls_version: None,
-                #[cfg(feature = "__tls")]
-                tls: TlsBackend::default(),
                 http_version_pref: HttpVersionPref::All,
                 http09_responses: false,
                 http1_title_case_headers: false,
@@ -205,265 +169,21 @@ impl ClientBuilder {
             return Err(err);
         }
 
-        let mut proxies = config.proxies;
-        if config.auto_sys_proxy {
-            proxies.push(Proxy::system());
-        }
-        let proxies = Arc::new(proxies);
-
         let mut connector = {
-            #[cfg(feature = "__tls")]
-            fn user_agent(headers: &HeaderMap) -> Option<HeaderValue> {
-                headers.get(USER_AGENT).cloned()
-            }
-
             let http = match config.trust_dns {
-                false => {
-                    if config.dns_overrides.is_empty() {
-                        HttpConnector::new_gai()
-                    } else {
-                        HttpConnector::new_gai_with_overrides(config.dns_overrides)
-                    }
-                }
-                #[cfg(feature = "trust-dns")]
-                true => {
-                    if config.dns_overrides.is_empty() {
-                        HttpConnector::new_trust_dns()?
-                    } else {
-                        HttpConnector::new_trust_dns_with_overrides(config.dns_overrides)?
-                    }
-                }
-                #[cfg(not(feature = "trust-dns"))]
+                false => HttpConnector::new(),
                 true => unreachable!("trust-dns shouldn't be enabled unless the feature is"),
             };
-
-            #[cfg(feature = "__tls")]
-            match config.tls {
-                #[cfg(feature = "default-tls")]
-                TlsBackend::Default => {
-                    let mut tls = TlsConnector::builder();
-
-                    #[cfg(feature = "native-tls-alpn")]
-                    {
-                        match config.http_version_pref {
-                            HttpVersionPref::Http1 => {
-                                tls.request_alpns(&["http/1.1"]);
-                            }
-                            HttpVersionPref::Http2 => {
-                                tls.request_alpns(&["h2"]);
-                            }
-                            HttpVersionPref::All => {
-                                tls.request_alpns(&["h2", "http/1.1"]);
-                            }
-                        }
-                    }
-
-                    #[cfg(feature = "native-tls")]
-                    {
-                        tls.danger_accept_invalid_hostnames(!config.hostname_verification);
-                    }
-
-                    tls.danger_accept_invalid_certs(!config.certs_verification);
-
-                    tls.disable_built_in_roots(!config.tls_built_in_root_certs);
-
-                    for cert in config.root_certs {
-                        cert.add_to_native_tls(&mut tls);
-                    }
-
-                    #[cfg(feature = "native-tls")]
-                    {
-                        if let Some(id) = config.identity {
-                            id.add_to_native_tls(&mut tls)?;
-                        }
-                    }
-
-                    if let Some(min_tls_version) = config.min_tls_version {
-                        let protocol = min_tls_version.to_native_tls().ok_or_else(|| {
-                            // TLS v1.3. This would be entirely reasonable,
-                            // native-tls just doesn't support it.
-                            // https://github.com/sfackler/rust-native-tls/issues/140
-                            crate::error::builder("invalid minimum TLS version for backend")
-                        })?;
-                        tls.min_protocol_version(Some(protocol));
-                    }
-
-                    if let Some(max_tls_version) = config.max_tls_version {
-                        let protocol = max_tls_version.to_native_tls().ok_or_else(|| {
-                            // TLS v1.3.
-                            // We could arguably do max_protocol_version(None), given
-                            // that 1.4 does not exist yet, but that'd get messy in the
-                            // future.
-                            crate::error::builder("invalid maximum TLS version for backend")
-                        })?;
-                        tls.max_protocol_version(Some(protocol));
-                    }
-
-                    Connector::new_default_tls(
-                        http,
-                        tls,
-                        proxies.clone(),
-                        user_agent(&config.headers),
-                        config.local_address,
-                        config.nodelay,
-                    )?
-                }
-                #[cfg(feature = "native-tls")]
-                TlsBackend::BuiltNativeTls(conn) => Connector::from_built_default_tls(
-                    http,
-                    conn,
-                    proxies.clone(),
-                    user_agent(&config.headers),
-                    config.local_address,
-                    config.nodelay,
-                ),
-                #[cfg(feature = "__rustls")]
-                TlsBackend::BuiltRustls(conn) => Connector::new_rustls_tls(
-                    http,
-                    conn,
-                    proxies.clone(),
-                    user_agent(&config.headers),
-                    config.local_address,
-                    config.nodelay,
-                ),
-                #[cfg(feature = "__rustls")]
-                TlsBackend::Rustls => {
-                    use crate::tls::NoVerifier;
-
-                    // Set root certificates.
-                    let mut root_cert_store = rustls::RootCertStore::empty();
-                    for cert in config.root_certs {
-                        cert.add_to_rustls(&mut root_cert_store)?;
-                    }
-
-                    #[cfg(feature = "rustls-tls-webpki-roots")]
-                    if config.tls_built_in_root_certs {
-                        use rustls::OwnedTrustAnchor;
-
-                        let trust_anchors =
-                            webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|trust_anchor| {
-                                OwnedTrustAnchor::from_subject_spki_name_constraints(
-                                    trust_anchor.subject,
-                                    trust_anchor.spki,
-                                    trust_anchor.name_constraints,
-                                )
-                            });
-
-                        root_cert_store.add_server_trust_anchors(trust_anchors);
-                    }
-
-                    #[cfg(feature = "rustls-tls-native-roots")]
-                    if config.tls_built_in_root_certs {
-                        let mut valid_count = 0;
-                        let mut invalid_count = 0;
-                        for cert in rustls_native_certs::load_native_certs()
-                            .map_err(crate::error::builder)?
-                        {
-                            let cert = rustls::Certificate(cert.0);
-                            // Continue on parsing errors, as native stores often include ancient or syntactically
-                            // invalid certificates, like root certificates without any X509 extensions.
-                            // Inspiration: https://github.com/rustls/rustls/blob/633bf4ba9d9521a95f68766d04c22e2b01e68318/rustls/src/anchors.rs#L105-L112
-                            match root_cert_store.add(&cert) {
-                                Ok(_) => valid_count += 1,
-                                Err(err) => {
-                                    invalid_count += 1;
-                                    log::warn!(
-                                        "rustls failed to parse DER certificate {:?} {:?}",
-                                        &err,
-                                        &cert
-                                    );
-                                }
-                            }
-                        }
-                        if valid_count == 0 && invalid_count > 0 {
-                            return Err(crate::error::builder(
-                                "zero valid certificates found in native root store",
-                            ));
-                        }
-                    }
-
-                    // Set TLS versions.
-                    let mut versions = rustls::ALL_VERSIONS.to_vec();
-
-                    if let Some(min_tls_version) = config.min_tls_version {
-                        versions.retain(|&supported_version| {
-                            match tls::Version::from_rustls(supported_version.version) {
-                                Some(version) => version >= min_tls_version,
-                                // Assume it's so new we don't know about it, allow it
-                                // (as of writing this is unreachable)
-                                None => true,
-                            }
-                        });
-                    }
-
-                    if let Some(max_tls_version) = config.max_tls_version {
-                        versions.retain(|&supported_version| {
-                            match tls::Version::from_rustls(supported_version.version) {
-                                Some(version) => version <= max_tls_version,
-                                None => false,
-                            }
-                        });
-                    }
-
-                    // Build TLS config
-                    let config_builder = rustls::ClientConfig::builder()
-                        .with_safe_default_cipher_suites()
-                        .with_safe_default_kx_groups()
-                        .with_protocol_versions(&versions)
-                        .map_err(crate::error::builder)?
-                        .with_root_certificates(root_cert_store);
-
-                    // Finalize TLS config
-                    let mut tls = if let Some(id) = config.identity {
-                        id.add_to_rustls(config_builder)?
-                    } else {
-                        config_builder.with_no_client_auth()
-                    };
-
-                    // Certificate verifier
-                    if !config.certs_verification {
-                        tls.dangerous()
-                            .set_certificate_verifier(Arc::new(NoVerifier));
-                    }
-
-                    // ALPN protocol
-                    match config.http_version_pref {
-                        HttpVersionPref::Http1 => {
-                            tls.alpn_protocols = vec!["http/1.1".into()];
-                        }
-                        HttpVersionPref::Http2 => {
-                            tls.alpn_protocols = vec!["h2".into()];
-                        }
-                        HttpVersionPref::All => {
-                            tls.alpn_protocols = vec!["h2".into(), "http/1.1".into()];
-                        }
-                    }
-
-                    Connector::new_rustls_tls(
-                        http,
-                        tls,
-                        proxies.clone(),
-                        user_agent(&config.headers),
-                        config.local_address,
-                        config.nodelay,
-                    )
-                }
-                #[cfg(any(feature = "native-tls", feature = "__rustls",))]
-                TlsBackend::UnknownPreconfigured => {
-                    return Err(crate::error::builder(
-                        "Unknown TLS backend passed to `use_preconfigured_tls`",
-                    ));
-                }
-            }
-
-            #[cfg(not(feature = "__tls"))]
-            Connector::new(http, proxies.clone(), config.local_address, config.nodelay)
+            Connector::new(http, config.local_address, config.nodelay)
         };
 
         connector.set_timeout(config.connect_timeout);
         connector.set_verbose(config.connection_verbose);
 
         let mut builder = hyper::Client::builder();
+
+        builder.executor(pink_sidevm::exec::HyperExecutor);
+
         if matches!(config.http_version_pref, HttpVersionPref::Http2) {
             builder.http2_only(true);
         }
@@ -481,15 +201,6 @@ impl ClientBuilder {
         }
         if let Some(http2_max_frame_size) = config.http2_max_frame_size {
             builder.http2_max_frame_size(http2_max_frame_size);
-        }
-        if let Some(http2_keep_alive_interval) = config.http2_keep_alive_interval {
-            builder.http2_keep_alive_interval(http2_keep_alive_interval);
-        }
-        if let Some(http2_keep_alive_timeout) = config.http2_keep_alive_timeout {
-            builder.http2_keep_alive_timeout(http2_keep_alive_timeout);
-        }
-        if config.http2_keep_alive_while_idle {
-            builder.http2_keep_alive_while_idle(true);
         }
 
         builder.pool_idle_timeout(config.pool_idle_timeout);
@@ -510,8 +221,6 @@ impl ClientBuilder {
 
         let hyper_client = builder.build(connector);
 
-        let proxies_maybe_http_auth = proxies.iter().any(|p| p.maybe_has_http_auth());
-
         Ok(Client {
             inner: Arc::new(ClientRef {
                 accepts: config.accepts,
@@ -522,8 +231,6 @@ impl ClientBuilder {
                 redirect_policy: config.redirect_policy,
                 referer: config.referer,
                 request_timeout: config.timeout,
-                proxies,
-                proxies_maybe_http_auth,
                 https_only: config.https_only,
             }),
         })
@@ -796,28 +503,6 @@ impl ClientBuilder {
         self
     }
 
-    // Proxy options
-
-    /// Add a `Proxy` to the list of proxies the `Client` will use.
-    ///
-    /// # Note
-    ///
-    /// Adding a proxy will disable the automatic usage of the "system" proxy.
-    pub fn proxy(mut self, proxy: Proxy) -> ClientBuilder {
-        self.config.proxies.push(proxy);
-        self.config.auto_sys_proxy = false;
-        self
-    }
-
-    /// Clear all `Proxies`, so `Client` will use no proxy anymore.
-    ///
-    /// This also disables the automatic usage of the "system" proxy.
-    pub fn no_proxy(mut self) -> ClientBuilder {
-        self.config.proxies.clear();
-        self.config.auto_sys_proxy = false;
-        self
-    }
-
     // Timeout options
 
     /// Enables a request timeout.
@@ -1025,176 +710,6 @@ impl ClientBuilder {
 
     // TLS options
 
-    /// Add a custom root certificate.
-    ///
-    /// This can be used to connect to a server that has a self-signed
-    /// certificate for example.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
-    /// feature to be enabled.
-    #[cfg(feature = "__tls")]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "default-tls",
-            feature = "native-tls",
-            feature = "rustls-tls"
-        )))
-    )]
-    pub fn add_root_certificate(mut self, cert: Certificate) -> ClientBuilder {
-        self.config.root_certs.push(cert);
-        self
-    }
-
-    /// Controls the use of built-in/preloaded certificates during certificate validation.
-    ///
-    /// Defaults to `true` -- built-in system certs will be used.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
-    /// feature to be enabled.
-    #[cfg(feature = "__tls")]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "default-tls",
-            feature = "native-tls",
-            feature = "rustls-tls"
-        )))
-    )]
-    pub fn tls_built_in_root_certs(mut self, tls_built_in_root_certs: bool) -> ClientBuilder {
-        self.config.tls_built_in_root_certs = tls_built_in_root_certs;
-        self
-    }
-
-    /// Sets the identity to be used for client certificate authentication.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `native-tls` or `rustls-tls(-...)` feature to be
-    /// enabled.
-    #[cfg(any(feature = "native-tls", feature = "__rustls"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
-    pub fn identity(mut self, identity: Identity) -> ClientBuilder {
-        self.config.identity = Some(identity);
-        self
-    }
-
-    /// Controls the use of hostname verification.
-    ///
-    /// Defaults to `false`.
-    ///
-    /// # Warning
-    ///
-    /// You should think very carefully before you use this method. If
-    /// hostname verification is not used, any valid certificate for any
-    /// site will be trusted for use from any other. This introduces a
-    /// significant vulnerability to man-in-the-middle attacks.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `native-tls` feature to be enabled.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn danger_accept_invalid_hostnames(
-        mut self,
-        accept_invalid_hostname: bool,
-    ) -> ClientBuilder {
-        self.config.hostname_verification = !accept_invalid_hostname;
-        self
-    }
-
-    /// Controls the use of certificate validation.
-    ///
-    /// Defaults to `false`.
-    ///
-    /// # Warning
-    ///
-    /// You should think very carefully before using this method. If
-    /// invalid certificates are trusted, *any* certificate for *any* site
-    /// will be trusted for use. This includes expired certificates. This
-    /// introduces significant vulnerabilities, and should only be used
-    /// as a last resort.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
-    /// feature to be enabled.
-    #[cfg(feature = "__tls")]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "default-tls",
-            feature = "native-tls",
-            feature = "rustls-tls"
-        )))
-    )]
-    pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> ClientBuilder {
-        self.config.certs_verification = !accept_invalid_certs;
-        self
-    }
-
-    /// Set the minimum required TLS version for connections.
-    ///
-    /// By default the TLS backend's own default is used.
-    ///
-    /// # Errors
-    ///
-    /// A value of `tls::Version::TLS_1_3` will cause an error with the
-    /// `native-tls`/`default-tls` backend. This does not mean the version
-    /// isn't supported, just that it can't be set as a minimum due to
-    /// technical limitations.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
-    /// feature to be enabled.
-    #[cfg(feature = "__tls")]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "default-tls",
-            feature = "native-tls",
-            feature = "rustls-tls"
-        )))
-    )]
-    pub fn min_tls_version(mut self, version: tls::Version) -> ClientBuilder {
-        self.config.min_tls_version = Some(version);
-        self
-    }
-
-    /// Set the maximum allowed TLS version for connections.
-    ///
-    /// By default there's no maximum.
-    ///
-    /// # Errors
-    ///
-    /// A value of `tls::Version::TLS_1_3` will cause an error with the
-    /// `native-tls`/`default-tls` backend. This does not mean the version
-    /// isn't supported, just that it can't be set as a maximum due to
-    /// technical limitations.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
-    /// feature to be enabled.
-    #[cfg(feature = "__tls")]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "default-tls",
-            feature = "native-tls",
-            feature = "rustls-tls"
-        )))
-    )]
-    pub fn max_tls_version(mut self, version: tls::Version) -> ClientBuilder {
-        self.config.max_tls_version = Some(version);
-        self
-    }
-
     /// Force using the native TLS backend.
     ///
     /// Since multiple TLS backends can be optionally enabled, this option will
@@ -1206,7 +721,6 @@ impl ClientBuilder {
     #[cfg(feature = "native-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn use_native_tls(mut self) -> ClientBuilder {
-        self.config.tls = TlsBackend::Default;
         self
     }
 
@@ -1218,60 +732,9 @@ impl ClientBuilder {
     /// # Optional
     ///
     /// This requires the optional `rustls-tls(-...)` feature to be enabled.
-    #[cfg(feature = "__rustls")]
+    #[cfg(feature = "rustls-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
-    pub fn use_rustls_tls(mut self) -> ClientBuilder {
-        self.config.tls = TlsBackend::Rustls;
-        self
-    }
-
-    /// Use a preconfigured TLS backend.
-    ///
-    /// If the passed `Any` argument is not a TLS backend that reqwest
-    /// understands, the `ClientBuilder` will error when calling `build`.
-    ///
-    /// # Advanced
-    ///
-    /// This is an advanced option, and can be somewhat brittle. Usage requires
-    /// keeping the preconfigured TLS argument version in sync with reqwest,
-    /// since version mismatches will result in an "unknown" TLS backend.
-    ///
-    /// If possible, it's preferable to use the methods on `ClientBuilder`
-    /// to configure reqwest's TLS.
-    ///
-    /// # Optional
-    ///
-    /// This requires one of the optional features `native-tls` or
-    /// `rustls-tls(-...)` to be enabled.
-    #[cfg(any(feature = "native-tls", feature = "__rustls",))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
-    pub fn use_preconfigured_tls(mut self, tls: impl Any) -> ClientBuilder {
-        let mut tls = Some(tls);
-        #[cfg(feature = "native-tls")]
-        {
-            if let Some(conn) =
-                (&mut tls as &mut dyn Any).downcast_mut::<Option<native_tls_crate::TlsConnector>>()
-            {
-                let tls = conn.take().expect("is definitely Some");
-                let tls = crate::tls::TlsBackend::BuiltNativeTls(tls);
-                self.config.tls = tls;
-                return self;
-            }
-        }
-        #[cfg(feature = "__rustls")]
-        {
-            if let Some(conn) =
-                (&mut tls as &mut dyn Any).downcast_mut::<Option<rustls::ClientConfig>>()
-            {
-                let tls = conn.take().expect("is definitely Some");
-                let tls = crate::tls::TlsBackend::BuiltRustls(tls);
-                self.config.tls = tls;
-                return self;
-            }
-        }
-
-        // Otherwise, we don't recognize the TLS backend!
-        self.config.tls = crate::tls::TlsBackend::UnknownPreconfigured;
+    pub fn use_rustls_tls(self) -> ClientBuilder {
         self
     }
 
@@ -1285,7 +748,6 @@ impl ClientBuilder {
     #[cfg(feature = "trust-dns")]
     #[cfg_attr(docsrs, doc(cfg(feature = "trust-dns")))]
     pub fn trust_dns(mut self, enable: bool) -> ClientBuilder {
-        self.config.trust_dns = enable;
         self
     }
 
@@ -1311,19 +773,6 @@ impl ClientBuilder {
     /// Defaults to false.
     pub fn https_only(mut self, enabled: bool) -> ClientBuilder {
         self.config.https_only = enabled;
-        self
-    }
-
-    /// Override DNS resolution for specific domains to particular IP addresses.
-    ///
-    /// Warning
-    ///
-    /// Since the DNS protocol has no notion of ports, if you wish to send
-    /// traffic to a particular port you must include this port in the URL
-    /// itself, any port in the overridden addr will be ignored and traffic sent
-    /// to the conventional port for the given scheme (e.g. 80 for http).
-    pub fn resolve(mut self, domain: &str, addr: SocketAddr) -> ClientBuilder {
-        self.config.dns_overrides.insert(domain.to_string(), addr);
         self
     }
 }
@@ -1490,8 +939,6 @@ impl Client {
             None => (None, Body::empty()),
         };
 
-        self.proxy_auth(&uri, &mut headers);
-
         let mut req = hyper::Request::builder()
             .method(method.clone())
             .uri(uri)
@@ -1524,33 +971,6 @@ impl Client {
                 in_flight,
                 timeout,
             }),
-        }
-    }
-
-    fn proxy_auth(&self, dst: &Uri, headers: &mut HeaderMap) {
-        if !self.inner.proxies_maybe_http_auth {
-            return;
-        }
-
-        // Only set the header here if the destination scheme is 'http',
-        // since otherwise, the header will be included in the CONNECT tunnel
-        // request instead.
-        if dst.scheme() != Some(&Scheme::HTTP) {
-            return;
-        }
-
-        if headers.contains_key(PROXY_AUTHORIZATION) {
-            return;
-        }
-
-        for proxy in self.inner.proxies.iter() {
-            if proxy.is_match(dst) {
-                if let Some(header) = proxy.http_basic_auth(dst) {
-                    headers.insert(PROXY_AUTHORIZATION, header);
-                }
-
-                break;
-            }
         }
     }
 }
@@ -1612,14 +1032,6 @@ impl Config {
         }
 
         f.field("accepts", &self.accepts);
-
-        if !self.proxies.is_empty() {
-            f.field("proxies", &self.proxies);
-        }
-
-        if !self.redirect_policy.is_default() {
-            f.field("redirect_policy", &self.redirect_policy);
-        }
 
         if self.referer {
             f.field("referer", &true);
@@ -1701,8 +1113,6 @@ struct ClientRef {
     redirect_policy: redirect::Policy,
     referer: bool,
     request_timeout: Option<Duration>,
-    proxies: Arc<Vec<Proxy>>,
-    proxies_maybe_http_auth: bool,
     https_only: bool,
 }
 
@@ -1719,10 +1129,6 @@ impl ClientRef {
         }
 
         f.field("accepts", &self.accepts);
-
-        if !self.proxies.is_empty() {
-            f.field("proxies", &self.proxies);
-        }
 
         if !self.redirect_policy.is_default() {
             f.field("redirect_policy", &self.redirect_policy);

@@ -16,12 +16,6 @@ use tokio::sync::{mpsc, oneshot};
 use super::request::{Request, RequestBuilder};
 use super::response::Response;
 use super::wait;
-#[cfg(feature = "__tls")]
-use crate::tls;
-#[cfg(feature = "__tls")]
-use crate::Certificate;
-#[cfg(any(feature = "native-tls", feature = "__rustls"))]
-use crate::Identity;
 use crate::{async_impl, header, redirect, IntoUrl, Method, Proxy};
 
 /// A `Client` to make Requests with.
@@ -562,18 +556,6 @@ impl ClientBuilder {
     )]
     pub fn tls_built_in_root_certs(self, tls_built_in_root_certs: bool) -> ClientBuilder {
         self.with_inner(move |inner| inner.tls_built_in_root_certs(tls_built_in_root_certs))
-    }
-
-    /// Sets the identity to be used for client certificate authentication.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `native-tls` or `rustls-tls(-...)` feature to be
-    /// enabled.
-    #[cfg(any(feature = "native-tls", feature = "__rustls"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
-    pub fn identity(self, identity: Identity) -> ClientBuilder {
-        self.with_inner(move |inner| inner.identity(identity))
     }
 
     /// Controls the use of hostname verification.
