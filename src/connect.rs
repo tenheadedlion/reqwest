@@ -15,7 +15,6 @@ use std::time::Duration;
 use std::future::Future;
 
 use crate::error::BoxError;
-use pink_sidevm as sidevm;
 
 
 #[derive(Clone)]

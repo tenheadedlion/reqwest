@@ -71,7 +71,7 @@ bytes = "1.0"
 serde = "1.0"
 serde_urlencoded = "0.7.1"
 tower-service = "0.3"
-pink-sidevm = "0.1"
+sidevm = "0.1"
 
 # Optional deps...
 

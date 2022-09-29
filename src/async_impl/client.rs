@@ -182,7 +182,7 @@ impl ClientBuilder {
 
         let mut builder = hyper::Client::builder();
 
-        builder.executor(pink_sidevm::exec::HyperExecutor);
+        builder.executor(sidevm::exec::HyperExecutor);
 
         if matches!(config.http_version_pref, HttpVersionPref::Http2) {
             builder.http2_only(true);
